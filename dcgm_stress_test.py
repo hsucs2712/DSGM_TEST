@@ -115,6 +115,84 @@ def collect_gpu_data():
         return []
 
 
+def collect_dcgm_flops():
+    """使用 dcgmi 收集 FLOPS 數據 (實際 TFLOPS 數值)"""
+    flops_data = {}
+    
+    try:
+        # 使用 dcgmi dmon 取得效能數據
+        # 1006=FP64 TFLOPS, 1007=FP32 TFLOPS, 1008=FP16 TFLOPS, 
+        # 1009=Tensor TFLOPS, 1010=Mem BW GB/s
+        result = subprocess.run(
+            ["dcgmi", "dmon", "-e", "1006,1007,1008,1009,1010", "-c", "1"],
+            capture_output=True, text=True, timeout=15
+        )
+        
+        for line in result.stdout.strip().split('\n'):
+            # 跳過標題行
+            if line.startswith('GPU') or line.startswith('#') or line.startswith('Id') or not line.strip():
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 6:
+                try:
+                    gpu_id = int(parts[0])
+                    flops_data[gpu_id] = {
+                        'fp64_tflops': float(parts[1]) if parts[1] not in ['N/A', 'NA', '-'] else 0,
+                        'fp32_tflops': float(parts[2]) if parts[2] not in ['N/A', 'NA', '-'] else 0,
+                        'fp16_tflops': float(parts[3]) if parts[3] not in ['N/A', 'NA', '-'] else 0,
+                        'tensor_tflops': float(parts[4]) if parts[4] not in ['N/A', 'NA', '-'] else 0,
+                        'mem_bw_gbps': float(parts[5]) if parts[5] not in ['N/A', 'NA', '-'] else 0,
+                    }
+                except (ValueError, IndexError):
+                    continue
+    except Exception as e:
+        pass
+    
+    # 如果上面的 field ID 沒數據，嘗試其他方式
+    if not flops_data:
+        try:
+            # 嘗試用 dcgmi 的 profiling metrics
+            result = subprocess.run(
+                ["dcgmi", "dmon", "-e", "203,204,1001,1002,1003,1004,1005", "-c", "1"],
+                capture_output=True, text=True, timeout=15
+            )
+            
+            for line in result.stdout.strip().split('\n'):
+                if line.startswith('GPU') or line.startswith('#') or line.startswith('Id') or not line.strip():
+                    continue
+                
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        gpu_id = int(parts[0])
+                        flops_data[gpu_id] = {
+                            'fp64_tflops': float(parts[3]) if len(parts) > 3 and parts[3] not in ['N/A', 'NA', '-'] else 0,
+                            'fp32_tflops': float(parts[4]) if len(parts) > 4 and parts[4] not in ['N/A', 'NA', '-'] else 0,
+                            'fp16_tflops': float(parts[5]) if len(parts) > 5 and parts[5] not in ['N/A', 'NA', '-'] else 0,
+                            'tensor_tflops': float(parts[6]) if len(parts) > 6 and parts[6] not in ['N/A', 'NA', '-'] else 0,
+                            'mem_bw_gbps': float(parts[7]) if len(parts) > 7 and parts[7] not in ['N/A', 'NA', '-'] else 0,
+                        }
+                    except (ValueError, IndexError):
+                        continue
+        except:
+            pass
+    
+    return flops_data
+
+
+def get_gpu_theoretical_flops():
+    """取得 GPU 理論 FLOPS (用於參考)"""
+    # B200 理論值 (參考)
+    return {
+        'fp64_peak': 40.0,      # TFLOPS
+        'fp32_peak': 80.0,      # TFLOPS
+        'fp16_peak': 160.0,     # TFLOPS
+        'tensor_peak': 2500.0,  # TFLOPS (FP8)
+        'mem_bw_peak': 8000.0,  # GB/s (HBM3e)
+    }
+
+
 def get_system_sensors():
     """取得系統溫度和功耗"""
     system_data = {
@@ -170,7 +248,9 @@ def get_system_sensors():
 def monitor_thread(test_name, duration, output_prefix, all_results):
     """監控執行緒"""
     gpu_stats = defaultdict(lambda: {
-        'temps': [], 'powers': [], 'utils': []
+        'temps': [], 'powers': [], 'utils': [],
+        'fp64_tflops': [], 'fp32_tflops': [], 'fp16_tflops': [],
+        'tensor_tflops': [], 'mem_bw_gbps': []
     })
     system_stats = {
         'inlet_temps': [], 'outlet_temps': [], 'cpu_temps': [], 'system_powers': []
@@ -188,6 +268,7 @@ def monitor_thread(test_name, duration, output_prefix, all_results):
         elapsed = time.time() - start_time
         
         gpu_data = collect_gpu_data()
+        dcgm_flops = collect_dcgm_flops()
         sys_data = get_system_sensors()
         
         system_stats['inlet_temps'].append(sys_data['inlet_temp'])
@@ -197,6 +278,7 @@ def monitor_thread(test_name, duration, output_prefix, all_results):
         
         for gpu in gpu_data:
             gpu_id = gpu['gpu_id']
+            flops = dcgm_flops.get(gpu_id, {})
             
             record = {
                 'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
@@ -209,6 +291,11 @@ def monitor_thread(test_name, duration, output_prefix, all_results):
                 'gpu_power_limit_w': power_limits[gpu_id] if gpu_id < len(power_limits) else 1000,
                 'gpu_util_pct': gpu['util'],
                 'gpu_mem_used_mb': gpu['mem_used'],
+                'fp64_tflops': flops.get('fp64_tflops', 0),
+                'fp32_tflops': flops.get('fp32_tflops', 0),
+                'fp16_tflops': flops.get('fp16_tflops', 0),
+                'tensor_tflops': flops.get('tensor_tflops', 0),
+                'mem_bw_gbps': flops.get('mem_bw_gbps', 0),
                 'sys_inlet_temp_c': sys_data['inlet_temp'],
                 'sys_outlet_temp_c': sys_data['outlet_temp'],
                 'sys_cpu_temp_c': sys_data['cpu_temp'],
@@ -219,12 +306,19 @@ def monitor_thread(test_name, duration, output_prefix, all_results):
             gpu_stats[gpu_id]['temps'].append(gpu['temp'])
             gpu_stats[gpu_id]['powers'].append(gpu['power'])
             gpu_stats[gpu_id]['utils'].append(gpu['util'])
+            gpu_stats[gpu_id]['fp64_tflops'].append(flops.get('fp64_tflops', 0))
+            gpu_stats[gpu_id]['fp32_tflops'].append(flops.get('fp32_tflops', 0))
+            gpu_stats[gpu_id]['fp16_tflops'].append(flops.get('fp16_tflops', 0))
+            gpu_stats[gpu_id]['tensor_tflops'].append(flops.get('tensor_tflops', 0))
+            gpu_stats[gpu_id]['mem_bw_gbps'].append(flops.get('mem_bw_gbps', 0))
         
         # 即時顯示
         if gpu_data:
             total_gpu_power = sum(g['power'] for g in gpu_data)
             avg_temp = np.mean([g['temp'] for g in gpu_data])
-            print(f"\r[{test_name}] {elapsed:>6.0f}s | GPU Avg Temp: {avg_temp:.1f}°C | Total GPU Power: {total_gpu_power:.0f}W | Sys Power: {sys_data['system_power']:.0f}W", end='', flush=True)
+            avg_tensor = np.mean([dcgm_flops.get(g['gpu_id'], {}).get('tensor_tflops', 0) for g in gpu_data])
+            avg_fp32 = np.mean([dcgm_flops.get(g['gpu_id'], {}).get('fp32_tflops', 0) for g in gpu_data])
+            print(f"\r[{test_name}] {elapsed:>6.0f}s | Temp: {avg_temp:.1f}°C | GPU: {total_gpu_power:.0f}W | Sys: {sys_data['system_power']:.0f}W | Tensor: {avg_tensor:.1f} | FP32: {avg_fp32:.1f} TFLOPS", end='', flush=True)
         
         time.sleep(SAMPLE_INTERVAL)
     
@@ -312,6 +406,16 @@ def generate_summary_and_charts(all_results, output_prefix):
                 'power_limit': power_limit,
                 'util_avg': np.mean(stats['utils']),
                 'util_max': np.max(stats['utils']),
+                'fp64_tflops_avg': np.mean(stats['fp64_tflops']),
+                'fp64_tflops_max': np.max(stats['fp64_tflops']),
+                'fp32_tflops_avg': np.mean(stats['fp32_tflops']),
+                'fp32_tflops_max': np.max(stats['fp32_tflops']),
+                'fp16_tflops_avg': np.mean(stats['fp16_tflops']),
+                'fp16_tflops_max': np.max(stats['fp16_tflops']),
+                'tensor_tflops_avg': np.mean(stats['tensor_tflops']),
+                'tensor_tflops_max': np.max(stats['tensor_tflops']),
+                'mem_bw_gbps_avg': np.mean(stats['mem_bw_gbps']),
+                'mem_bw_gbps_max': np.max(stats['mem_bw_gbps']),
                 'sys_inlet_avg': np.mean([t for t in system_stats['inlet_temps'] if t > 0]) if any(t > 0 for t in system_stats['inlet_temps']) else 0,
                 'sys_outlet_avg': np.mean([t for t in system_stats['outlet_temps'] if t > 0]) if any(t > 0 for t in system_stats['outlet_temps']) else 0,
                 'sys_power_avg': np.mean([p for p in system_stats['system_powers'] if p > 0]) if any(p > 0 for p in system_stats['system_powers']) else 0,
@@ -319,7 +423,9 @@ def generate_summary_and_charts(all_results, output_prefix):
             }
             summary_data.append(row)
             
-            print(f"  GPU {gpu_id}: Temp {row['temp_avg']:.1f}°C (max {row['temp_max']:.1f}°C) | Power {row['power_avg']:.1f}W (max {row['power_max']:.1f}W) | Util {row['util_avg']:.1f}%")
+            print(f"  GPU {gpu_id}: Temp {row['temp_avg']:.1f}°C (max {row['temp_max']:.1f}°C) | Power {row['power_avg']:.1f}W (max {row['power_max']:.1f}W)")
+            print(f"          TFLOPS - Tensor: {row['tensor_tflops_avg']:.2f} (max {row['tensor_tflops_max']:.2f}) | FP32: {row['fp32_tflops_avg']:.2f} | FP16: {row['fp16_tflops_avg']:.2f} | FP64: {row['fp64_tflops_avg']:.2f}")
+            print(f"          Mem BW: {row['mem_bw_gbps_avg']:.1f} GB/s (max {row['mem_bw_gbps_max']:.1f} GB/s)")
         
         if any(p > 0 for p in system_stats['system_powers']):
             print(f"  System: Power avg {row['sys_power_avg']:.0f}W (max {row['sys_power_max']:.0f}W)")
@@ -350,7 +456,7 @@ def generate_comparison_charts(all_results, output_prefix):
     first_test = all_results[test_names[0]]
     gpu_ids = sorted(first_test['gpu_stats'].keys())
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
     fig.suptitle('DCGM Stress Test Comparison', fontsize=14, fontweight='bold')
     
     colors = plt.cm.Set2(np.linspace(0, 1, len(test_names)))
@@ -415,6 +521,49 @@ def generate_comparison_charts(all_results, output_prefix):
     ax4.legend(fontsize=8)
     ax4.grid(True, alpha=0.3, axis='y')
     
+    # 5. TFLOPS 比較 (平均)
+    ax5 = axes[2, 0]
+    flops_types = ['tensor_tflops', 'fp32_tflops', 'fp16_tflops', 'fp64_tflops']
+    flops_labels = ['Tensor', 'FP32', 'FP16', 'FP64']
+    x_flops = np.arange(len(test_names))
+    bar_w = 0.2
+    
+    for j, (ft, fl) in enumerate(zip(flops_types, flops_labels)):
+        avgs = []
+        for test_name in test_names:
+            all_gpu_avg = np.mean([np.mean(all_results[test_name]['gpu_stats'].get(gid, {}).get(ft, [0])) for gid in gpu_ids])
+            avgs.append(all_gpu_avg)
+        ax5.bar(x_flops + j * bar_w, avgs, bar_w, label=fl)
+    
+    ax5.set_xlabel('Test')
+    ax5.set_ylabel('TFLOPS')
+    ax5.set_title('Average TFLOPS by Test (All GPU)')
+    ax5.set_xticks(x_flops + 1.5 * bar_w)
+    ax5.set_xticklabels(test_names)
+    ax5.legend(fontsize=8)
+    ax5.grid(True, alpha=0.3, axis='y')
+    
+    # 6. 系統功耗比較
+    ax6 = axes[2, 1]
+    sys_power_avg = []
+    sys_power_max = []
+    for test_name in test_names:
+        sp = all_results[test_name]['system_stats']['system_powers']
+        valid_sp = [p for p in sp if p > 0]
+        sys_power_avg.append(np.mean(valid_sp) if valid_sp else 0)
+        sys_power_max.append(np.max(valid_sp) if valid_sp else 0)
+    
+    x_sys = np.arange(len(test_names))
+    ax6.bar(x_sys - 0.15, sys_power_avg, 0.3, label='Average', color='steelblue')
+    ax6.bar(x_sys + 0.15, sys_power_max, 0.3, label='Peak', color='coral')
+    ax6.set_xlabel('Test')
+    ax6.set_ylabel('Power (W)')
+    ax6.set_title('System Power by Test')
+    ax6.set_xticks(x_sys)
+    ax6.set_xticklabels(test_names)
+    ax6.legend(fontsize=8)
+    ax6.grid(True, alpha=0.3, axis='y')
+    
     plt.tight_layout()
     plt.savefig(chart_file, dpi=150, bbox_inches='tight')
     plt.close()
@@ -437,7 +586,7 @@ def generate_test_timeline(test_name, results, output_prefix):
     if not gpu_ids or not gpu_stats[gpu_ids[0]]['temps']:
         return
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
     fig.suptitle(f'{test_name} Test Timeline', fontsize=14, fontweight='bold')
     
     colors = plt.cm.tab10(np.linspace(0, 1, len(gpu_ids)))
@@ -468,32 +617,57 @@ def generate_test_timeline(test_name, results, output_prefix):
     ax2.legend(loc='upper right', fontsize=7, ncol=2)
     ax2.grid(True, alpha=0.3)
     
-    # 3. 系統溫度
+    # 3. Tensor Core TFLOPS
     ax3 = axes[1, 0]
-    x_sys = np.arange(len(system_stats['inlet_temps']))
-    if any(t > 0 for t in system_stats['inlet_temps']):
-        ax3.plot(x_sys, system_stats['inlet_temps'], label='Inlet', color='blue', linewidth=1.5)
-    if any(t > 0 for t in system_stats['outlet_temps']):
-        ax3.plot(x_sys, system_stats['outlet_temps'], label='Outlet', color='red', linewidth=1.5)
-    if any(t > 0 for t in system_stats['cpu_temps']):
-        ax3.plot(x_sys, system_stats['cpu_temps'], label='CPU', color='green', linewidth=1.5)
+    for i, gpu_id in enumerate(gpu_ids):
+        ax3.plot(x, gpu_stats[gpu_id]['tensor_tflops'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1)
     ax3.set_xlabel('Sample')
-    ax3.set_ylabel('Temperature (°C)')
-    ax3.set_title('System Temperature')
-    ax3.legend(loc='upper right', fontsize=8)
+    ax3.set_ylabel('TFLOPS')
+    ax3.set_title('Tensor Core Performance')
+    ax3.legend(loc='upper right', fontsize=7, ncol=2)
     ax3.grid(True, alpha=0.3)
     
-    # 4. 系統功耗 vs GPU 總功耗
+    # 4. FP32 / FP16 / FP64 TFLOPS
     ax4 = axes[1, 1]
-    if any(p > 0 for p in system_stats['system_powers']):
-        ax4.plot(x_sys, system_stats['system_powers'], label='System Power', color='purple', linewidth=1.5)
-    total_gpu = [sum(gpu_stats[gid]['powers'][i] for gid in gpu_ids if i < len(gpu_stats[gid]['powers'])) for i in range(samples)]
-    ax4.plot(x[:len(total_gpu)], total_gpu, label='Total GPU Power', color='orange', linewidth=1.5, linestyle='--')
+    # 計算所有 GPU 的平均值
+    fp32_avg = [np.mean([gpu_stats[gid]['fp32_tflops'][i] for gid in gpu_ids if i < len(gpu_stats[gid]['fp32_tflops'])]) for i in range(samples)]
+    fp16_avg = [np.mean([gpu_stats[gid]['fp16_tflops'][i] for gid in gpu_ids if i < len(gpu_stats[gid]['fp16_tflops'])]) for i in range(samples)]
+    fp64_avg = [np.mean([gpu_stats[gid]['fp64_tflops'][i] for gid in gpu_ids if i < len(gpu_stats[gid]['fp64_tflops'])]) for i in range(samples)]
+    ax4.plot(x, fp32_avg, label='FP32 Avg', color='blue', linewidth=1.5)
+    ax4.plot(x, fp16_avg, label='FP16 Avg', color='green', linewidth=1.5)
+    ax4.plot(x, fp64_avg, label='FP64 Avg', color='orange', linewidth=1.5)
     ax4.set_xlabel('Sample')
-    ax4.set_ylabel('Power (W)')
-    ax4.set_title('System vs GPU Power')
+    ax4.set_ylabel('TFLOPS')
+    ax4.set_title('FP32 / FP16 / FP64 Performance (All GPU Avg)')
     ax4.legend(loc='upper right', fontsize=8)
     ax4.grid(True, alpha=0.3)
+    
+    # 5. 系統溫度
+    ax5 = axes[2, 0]
+    x_sys = np.arange(len(system_stats['inlet_temps']))
+    if any(t > 0 for t in system_stats['inlet_temps']):
+        ax5.plot(x_sys, system_stats['inlet_temps'], label='Inlet', color='blue', linewidth=1.5)
+    if any(t > 0 for t in system_stats['outlet_temps']):
+        ax5.plot(x_sys, system_stats['outlet_temps'], label='Outlet', color='red', linewidth=1.5)
+    if any(t > 0 for t in system_stats['cpu_temps']):
+        ax5.plot(x_sys, system_stats['cpu_temps'], label='CPU', color='green', linewidth=1.5)
+    ax5.set_xlabel('Sample')
+    ax5.set_ylabel('Temperature (°C)')
+    ax5.set_title('System Temperature')
+    ax5.legend(loc='upper right', fontsize=8)
+    ax5.grid(True, alpha=0.3)
+    
+    # 6. 系統功耗 vs GPU 總功耗
+    ax6 = axes[2, 1]
+    if any(p > 0 for p in system_stats['system_powers']):
+        ax6.plot(x_sys, system_stats['system_powers'], label='System Power', color='purple', linewidth=1.5)
+    total_gpu = [sum(gpu_stats[gid]['powers'][i] for gid in gpu_ids if i < len(gpu_stats[gid]['powers'])) for i in range(samples)]
+    ax6.plot(x[:len(total_gpu)], total_gpu, label='Total GPU Power', color='orange', linewidth=1.5, linestyle='--')
+    ax6.set_xlabel('Sample')
+    ax6.set_ylabel('Power (W)')
+    ax6.set_title('System vs GPU Power')
+    ax6.legend(loc='upper right', fontsize=8)
+    ax6.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(chart_file, dpi=150, bbox_inches='tight')
