@@ -30,6 +30,99 @@ except ImportError:
     import numpy as np
 
 
+def get_system_sensors():
+    """使用 ipmitool 或 sensors 取得系統溫度和功耗"""
+    system_data = {
+        'inlet_temp': 0,
+        'outlet_temp': 0,
+        'cpu_temp': 0,
+        'system_power': 0,
+        'psu_power': 0,
+    }
+    
+    # 嘗試用 ipmitool 取得數據 (Supermicro 伺服器)
+    try:
+        result = subprocess.run(
+            ["sudo", "ipmitool", "sensor", "list"],
+            capture_output=True, text=True, timeout=10
+        )
+        
+        for line in result.stdout.split('\n'):
+            line_lower = line.lower()
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 2:
+                try:
+                    value = float(parts[1].split()[0]) if parts[1].split() else 0
+                except (ValueError, IndexError):
+                    continue
+                
+                # 進氣溫度
+                if any(x in line_lower for x in ['inlet', 'ambient', 'air_inlet', 'system temp']):
+                    if 'temp' in line_lower:
+                        system_data['inlet_temp'] = value
+                
+                # 出氣溫度
+                if any(x in line_lower for x in ['outlet', 'exhaust', 'air_outlet']):
+                    if 'temp' in line_lower:
+                        system_data['outlet_temp'] = value
+                
+                # CPU 溫度
+                if 'cpu' in line_lower and 'temp' in line_lower:
+                    if system_data['cpu_temp'] == 0 or value > system_data['cpu_temp']:
+                        system_data['cpu_temp'] = value
+                
+                # 系統功耗
+                if any(x in line_lower for x in ['system power', 'ps power', 'total power', 'pwr consumption']):
+                    system_data['system_power'] = value
+                
+                # PSU 功耗
+                if 'psu' in line_lower and 'power' in line_lower:
+                    system_data['psu_power'] += value
+                    
+    except Exception as e:
+        pass
+    
+    # 如果 ipmitool 沒數據，嘗試用 sensors (lm-sensors)
+    if system_data['cpu_temp'] == 0:
+        try:
+            result = subprocess.run(
+                ["sensors", "-u"],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            for line in result.stdout.split('\n'):
+                if 'temp' in line.lower() and 'input' in line.lower():
+                    try:
+                        value = float(line.split(':')[1].strip())
+                        if value > system_data['cpu_temp']:
+                            system_data['cpu_temp'] = value
+                    except:
+                        pass
+        except:
+            pass
+    
+    # 嘗試用 ipmitool dcmi power reading 取得功耗
+    if system_data['system_power'] == 0:
+        try:
+            result = subprocess.run(
+                ["sudo", "ipmitool", "dcmi", "power", "reading"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.split('\n'):
+                if 'instantaneous' in line.lower() or 'current' in line.lower():
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        try:
+                            value = float(parts[1].strip().split()[0])
+                            system_data['system_power'] = value
+                        except:
+                            pass
+        except:
+            pass
+    
+    return system_data
+
+
 def get_gpu_count():
     """取得 GPU 數量"""
     try:
@@ -165,13 +258,17 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
         'fp32_flops': [], 'fp64_flops': [], 'tensor_flops': [],
         'mem_bw': []
     })
+    system_stats = {
+        'inlet_temps': [], 'outlet_temps': [], 'cpu_temps': [],
+        'system_powers': [], 'psu_powers': []
+    }
     
     start_time = time.time()
     sample_count = 0
     
     print("\n開始監控... (Ctrl+C 可提前結束)\n")
-    print(f"{'Time':<12} {'GPU':<5} {'Temp(C)':<10} {'Power(W)':<12} {'Util(%)':<10} {'TensorFLOPS':<12}")
-    print("-" * 70)
+    print(f"{'Time':<10} {'GPU':<4} {'Temp':<8} {'Power':<10} {'Util':<8} {'Tensor':<10} | {'Inlet':<8} {'Outlet':<8} {'SysPwr':<10}")
+    print("-" * 95)
     
     try:
         while time.time() - start_time < duration:
@@ -181,8 +278,16 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
             # 收集數據
             smi_data = collect_nvidia_smi_data()
             dcgm_data = collect_dcgm_data()
+            system_data = get_system_sensors()
             
-            for gpu in smi_data:
+            # 記錄系統數據
+            system_stats['inlet_temps'].append(system_data['inlet_temp'])
+            system_stats['outlet_temps'].append(system_data['outlet_temp'])
+            system_stats['cpu_temps'].append(system_data['cpu_temp'])
+            system_stats['system_powers'].append(system_data['system_power'])
+            system_stats['psu_powers'].append(system_data['psu_power'])
+            
+            for idx, gpu in enumerate(smi_data):
                 gpu_id = gpu['gpu_id']
                 
                 # 合併 DCGM 數據
@@ -192,17 +297,22 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
                     'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
                     'elapsed_sec': round(elapsed, 1),
                     'gpu_id': gpu_id,
-                    'temp_c': gpu['temp'],
-                    'temp_limit_c': temp_limits[gpu_id] if gpu_id < len(temp_limits) else temp_limits[0],
-                    'power_w': gpu['power'],
-                    'power_limit_w': power_limits[gpu_id] if gpu_id < len(power_limits) else power_limits[0],
-                    'util_pct': gpu['util'],
-                    'mem_used_mb': gpu['mem_used'],
-                    'mem_total_mb': gpu['mem_total'],
+                    'gpu_temp_c': gpu['temp'],
+                    'gpu_temp_limit_c': temp_limits[gpu_id] if gpu_id < len(temp_limits) else temp_limits[0],
+                    'gpu_power_w': gpu['power'],
+                    'gpu_power_limit_w': power_limits[gpu_id] if gpu_id < len(power_limits) else power_limits[0],
+                    'gpu_util_pct': gpu['util'],
+                    'gpu_mem_used_mb': gpu['mem_used'],
+                    'gpu_mem_total_mb': gpu['mem_total'],
                     'fp32_flops': dcgm.get('fp32_flops', 0),
                     'fp64_flops': dcgm.get('fp64_flops', 0),
                     'tensor_flops': dcgm.get('tensor_flops', 0),
                     'mem_bw_pct': dcgm.get('mem_bw', 0),
+                    'sys_inlet_temp_c': system_data['inlet_temp'],
+                    'sys_outlet_temp_c': system_data['outlet_temp'],
+                    'sys_cpu_temp_c': system_data['cpu_temp'],
+                    'sys_power_w': system_data['system_power'],
+                    'sys_psu_power_w': system_data['psu_power'],
                 }
                 
                 all_data.append(record)
@@ -217,8 +327,11 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
                 stats['tensor_flops'].append(dcgm.get('tensor_flops', 0))
                 stats['mem_bw'].append(dcgm.get('mem_bw', 0))
                 
-                # 即時顯示
-                print(f"{elapsed:>8.1f}s   {gpu_id:<5} {gpu['temp']:<10.1f} {gpu['power']:<12.1f} {gpu['util']:<10.1f} {dcgm.get('tensor_flops', 0):<12.1f}")
+                # 即時顯示 (只顯示第一張 GPU 時顯示系統數據)
+                if idx == 0:
+                    print(f"{elapsed:>7.1f}s  {gpu_id:<4} {gpu['temp']:<8.1f} {gpu['power']:<10.1f} {gpu['util']:<8.1f} {dcgm.get('tensor_flops', 0):<10.1f} | {system_data['inlet_temp']:<8.1f} {system_data['outlet_temp']:<8.1f} {system_data['system_power']:<10.1f}")
+                else:
+                    print(f"{elapsed:>7.1f}s  {gpu_id:<4} {gpu['temp']:<8.1f} {gpu['power']:<10.1f} {gpu['util']:<8.1f} {dcgm.get('tensor_flops', 0):<10.1f} |")
             
             sample_count += 1
             time.sleep(interval)
@@ -247,22 +360,37 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
     print("統計摘要")
     print("=" * 60)
     
+    # 系統統計
+    print("\n--- 系統 (System) ---")
+    if system_stats['inlet_temps'] and any(t > 0 for t in system_stats['inlet_temps']):
+        inlet_temps = [t for t in system_stats['inlet_temps'] if t > 0]
+        print(f"進氣溫度: 平均 {np.mean(inlet_temps):.1f}°C | 最高 {np.max(inlet_temps):.1f}°C")
+    if system_stats['outlet_temps'] and any(t > 0 for t in system_stats['outlet_temps']):
+        outlet_temps = [t for t in system_stats['outlet_temps'] if t > 0]
+        print(f"出氣溫度: 平均 {np.mean(outlet_temps):.1f}°C | 最高 {np.max(outlet_temps):.1f}°C")
+    if system_stats['cpu_temps'] and any(t > 0 for t in system_stats['cpu_temps']):
+        cpu_temps = [t for t in system_stats['cpu_temps'] if t > 0]
+        print(f"CPU 溫度: 平均 {np.mean(cpu_temps):.1f}°C | 最高 {np.max(cpu_temps):.1f}°C")
+    if system_stats['system_powers'] and any(p > 0 for p in system_stats['system_powers']):
+        sys_powers = [p for p in system_stats['system_powers'] if p > 0]
+        print(f"系統功耗: 平均 {np.mean(sys_powers):.1f}W | 最高 {np.max(sys_powers):.1f}W")
+    
     for gpu_id, stats in sorted(gpu_stats.items()):
         temp_limit = temp_limits[gpu_id] if gpu_id < len(temp_limits) else temp_limits[0]
         power_limit = power_limits[gpu_id] if gpu_id < len(power_limits) else power_limits[0]
         
         summary = {
             'gpu_id': gpu_id,
-            'temp_avg': np.mean(stats['temps']),
-            'temp_max': np.max(stats['temps']),
-            'temp_min': np.min(stats['temps']),
-            'temp_limit': temp_limit,
-            'power_avg': np.mean(stats['powers']),
-            'power_max': np.max(stats['powers']),
-            'power_min': np.min(stats['powers']),
-            'power_limit': power_limit,
-            'util_avg': np.mean(stats['utils']),
-            'util_max': np.max(stats['utils']),
+            'gpu_temp_avg': np.mean(stats['temps']),
+            'gpu_temp_max': np.max(stats['temps']),
+            'gpu_temp_min': np.min(stats['temps']),
+            'gpu_temp_limit': temp_limit,
+            'gpu_power_avg': np.mean(stats['powers']),
+            'gpu_power_max': np.max(stats['powers']),
+            'gpu_power_min': np.min(stats['powers']),
+            'gpu_power_limit': power_limit,
+            'gpu_util_avg': np.mean(stats['utils']),
+            'gpu_util_max': np.max(stats['utils']),
             'fp32_flops_avg': np.mean(stats['fp32_flops']),
             'fp32_flops_max': np.max(stats['fp32_flops']),
             'fp64_flops_avg': np.mean(stats['fp64_flops']),
@@ -271,14 +399,22 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
             'tensor_flops_max': np.max(stats['tensor_flops']),
             'mem_bw_avg': np.mean(stats['mem_bw']),
             'mem_bw_max': np.max(stats['mem_bw']),
+            'sys_inlet_temp_avg': np.mean([t for t in system_stats['inlet_temps'] if t > 0]) if any(t > 0 for t in system_stats['inlet_temps']) else 0,
+            'sys_inlet_temp_max': np.max([t for t in system_stats['inlet_temps'] if t > 0]) if any(t > 0 for t in system_stats['inlet_temps']) else 0,
+            'sys_outlet_temp_avg': np.mean([t for t in system_stats['outlet_temps'] if t > 0]) if any(t > 0 for t in system_stats['outlet_temps']) else 0,
+            'sys_outlet_temp_max': np.max([t for t in system_stats['outlet_temps'] if t > 0]) if any(t > 0 for t in system_stats['outlet_temps']) else 0,
+            'sys_cpu_temp_avg': np.mean([t for t in system_stats['cpu_temps'] if t > 0]) if any(t > 0 for t in system_stats['cpu_temps']) else 0,
+            'sys_cpu_temp_max': np.max([t for t in system_stats['cpu_temps'] if t > 0]) if any(t > 0 for t in system_stats['cpu_temps']) else 0,
+            'sys_power_avg': np.mean([p for p in system_stats['system_powers'] if p > 0]) if any(p > 0 for p in system_stats['system_powers']) else 0,
+            'sys_power_max': np.max([p for p in system_stats['system_powers'] if p > 0]) if any(p > 0 for p in system_stats['system_powers']) else 0,
             'samples': len(stats['temps']),
         }
         summary_data.append(summary)
         
         print(f"\n--- GPU {gpu_id} ---")
-        print(f"溫度: 平均 {summary['temp_avg']:.1f}°C | 最高 {summary['temp_max']:.1f}°C | 上限 {temp_limit}°C")
-        print(f"功耗: 平均 {summary['power_avg']:.1f}W | 最高 {summary['power_max']:.1f}W | 上限 {power_limit}W")
-        print(f"使用率: 平均 {summary['util_avg']:.1f}% | 最高 {summary['util_max']:.1f}%")
+        print(f"溫度: 平均 {summary['gpu_temp_avg']:.1f}°C | 最高 {summary['gpu_temp_max']:.1f}°C | 上限 {temp_limit}°C")
+        print(f"功耗: 平均 {summary['gpu_power_avg']:.1f}W | 最高 {summary['gpu_power_max']:.1f}W | 上限 {power_limit}W")
+        print(f"使用率: 平均 {summary['gpu_util_avg']:.1f}% | 最高 {summary['gpu_util_max']:.1f}%")
         print(f"Tensor FLOPS: 平均 {summary['tensor_flops_avg']:.1f} | 最高 {summary['tensor_flops_max']:.1f}")
         print(f"FP32 FLOPS: 平均 {summary['fp32_flops_avg']:.1f} | 最高 {summary['fp32_flops_max']:.1f}")
         print(f"FP64 FLOPS: 平均 {summary['fp64_flops_avg']:.1f} | 最高 {summary['fp64_flops_max']:.1f}")
@@ -293,13 +429,13 @@ def monitor_gpus(duration=60, interval=1, output_prefix="gpu_monitor"):
     
     # 生成圖表
     if all_data:
-        chart_file = generate_charts(all_data, gpu_stats, power_limits, temp_limits, output_prefix)
+        chart_file = generate_charts(all_data, gpu_stats, system_stats, power_limits, temp_limits, output_prefix)
         print(f"✓ 圖表已保存: {chart_file}")
     
     return csv_file, summary_file
 
 
-def generate_charts(all_data, gpu_stats, power_limits, temp_limits, output_prefix):
+def generate_charts(all_data, gpu_stats, system_stats, power_limits, temp_limits, output_prefix):
     """生成監控圖表"""
     
     chart_file = f"{output_prefix}_charts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
@@ -307,16 +443,16 @@ def generate_charts(all_data, gpu_stats, power_limits, temp_limits, output_prefi
     # 準備每個 GPU 的時序數據
     gpu_ids = sorted(gpu_stats.keys())
     
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
-    fig.suptitle('GPU Monitoring Report', fontsize=14, fontweight='bold')
+    fig, axes = plt.subplots(4, 2, figsize=(14, 16))
+    fig.suptitle('GPU & System Monitoring Report', fontsize=14, fontweight='bold')
     
-    colors = plt.cm.tab10(np.linspace(0, 1, len(gpu_ids)))
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(gpu_ids), 3)))
     
     # 每個 GPU 的採樣數
     samples_per_gpu = len(gpu_stats[gpu_ids[0]]['temps'])
     x = np.arange(samples_per_gpu)
     
-    # 1. 溫度曲線
+    # 1. GPU 溫度曲線
     ax1 = axes[0, 0]
     for i, gpu_id in enumerate(gpu_ids):
         ax1.plot(x, gpu_stats[gpu_id]['temps'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1.5)
@@ -328,7 +464,7 @@ def generate_charts(all_data, gpu_stats, power_limits, temp_limits, output_prefi
     ax1.legend(loc='upper right', fontsize=8)
     ax1.grid(True, alpha=0.3)
     
-    # 2. 功耗曲線
+    # 2. GPU 功耗曲線
     ax2 = axes[0, 1]
     for i, gpu_id in enumerate(gpu_ids):
         ax2.plot(x, gpu_stats[gpu_id]['powers'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1.5)
@@ -340,62 +476,93 @@ def generate_charts(all_data, gpu_stats, power_limits, temp_limits, output_prefi
     ax2.legend(loc='upper right', fontsize=8)
     ax2.grid(True, alpha=0.3)
     
-    # 3. GPU 使用率
+    # 3. 系統溫度曲線
     ax3 = axes[1, 0]
-    for i, gpu_id in enumerate(gpu_ids):
-        ax3.plot(x, gpu_stats[gpu_id]['utils'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1.5)
+    x_sys = np.arange(len(system_stats['inlet_temps']))
+    if any(t > 0 for t in system_stats['inlet_temps']):
+        ax3.plot(x_sys, system_stats['inlet_temps'], label='Inlet', color='blue', linewidth=1.5)
+    if any(t > 0 for t in system_stats['outlet_temps']):
+        ax3.plot(x_sys, system_stats['outlet_temps'], label='Outlet', color='red', linewidth=1.5)
+    if any(t > 0 for t in system_stats['cpu_temps']):
+        ax3.plot(x_sys, system_stats['cpu_temps'], label='CPU', color='green', linewidth=1.5)
     ax3.set_xlabel('Sample')
-    ax3.set_ylabel('Utilization (%)')
-    ax3.set_title('GPU Utilization')
-    ax3.set_ylim(0, 105)
+    ax3.set_ylabel('Temperature (°C)')
+    ax3.set_title('System Temperature (Inlet/Outlet/CPU)')
     ax3.legend(loc='upper right', fontsize=8)
     ax3.grid(True, alpha=0.3)
     
-    # 4. Tensor FLOPS
+    # 4. 系統功耗曲線
     ax4 = axes[1, 1]
-    for i, gpu_id in enumerate(gpu_ids):
-        ax4.plot(x, gpu_stats[gpu_id]['tensor_flops'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1.5)
+    if any(p > 0 for p in system_stats['system_powers']):
+        ax4.plot(x_sys, system_stats['system_powers'], label='System Power', color='purple', linewidth=1.5)
+    # 計算 GPU 總功耗
+    total_gpu_power = []
+    for i in range(samples_per_gpu):
+        total = sum(gpu_stats[gid]['powers'][i] for gid in gpu_ids if i < len(gpu_stats[gid]['powers']))
+        total_gpu_power.append(total)
+    ax4.plot(x[:len(total_gpu_power)], total_gpu_power, label='Total GPU Power', color='orange', linewidth=1.5, linestyle='--')
     ax4.set_xlabel('Sample')
-    ax4.set_ylabel('Tensor Core Activity (%)')
-    ax4.set_title('Tensor Core FLOPS')
+    ax4.set_ylabel('Power (W)')
+    ax4.set_title('System Power vs Total GPU Power')
     ax4.legend(loc='upper right', fontsize=8)
     ax4.grid(True, alpha=0.3)
     
-    # 5. 統計長條圖 - 溫度 & 功耗
+    # 5. GPU 使用率
     ax5 = axes[2, 0]
+    for i, gpu_id in enumerate(gpu_ids):
+        ax5.plot(x, gpu_stats[gpu_id]['utils'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1.5)
+    ax5.set_xlabel('Sample')
+    ax5.set_ylabel('Utilization (%)')
+    ax5.set_title('GPU Utilization')
+    ax5.set_ylim(0, 105)
+    ax5.legend(loc='upper right', fontsize=8)
+    ax5.grid(True, alpha=0.3)
+    
+    # 6. Tensor FLOPS
+    ax6 = axes[2, 1]
+    for i, gpu_id in enumerate(gpu_ids):
+        ax6.plot(x, gpu_stats[gpu_id]['tensor_flops'], label=f'GPU {gpu_id}', color=colors[i], linewidth=1.5)
+    ax6.set_xlabel('Sample')
+    ax6.set_ylabel('Tensor Core Activity (%)')
+    ax6.set_title('Tensor Core FLOPS')
+    ax6.legend(loc='upper right', fontsize=8)
+    ax6.grid(True, alpha=0.3)
+    
+    # 7. 統計長條圖 - 溫度
+    ax7 = axes[3, 0]
     bar_width = 0.35
     x_bars = np.arange(len(gpu_ids))
     
     temp_avgs = [np.mean(gpu_stats[gid]['temps']) for gid in gpu_ids]
     temp_maxs = [np.max(gpu_stats[gid]['temps']) for gid in gpu_ids]
     
-    ax5.bar(x_bars - bar_width/2, temp_avgs, bar_width, label='Average', color='steelblue')
-    ax5.bar(x_bars + bar_width/2, temp_maxs, bar_width, label='Peak', color='coral')
-    ax5.axhline(y=temp_limits[0], color='red', linestyle='--', label=f'Limit', alpha=0.7)
-    ax5.set_xlabel('GPU ID')
-    ax5.set_ylabel('Temperature (°C)')
-    ax5.set_title('Temperature Statistics')
-    ax5.set_xticks(x_bars)
-    ax5.set_xticklabels([f'GPU {gid}' for gid in gpu_ids])
-    ax5.legend(fontsize=8)
-    ax5.grid(True, alpha=0.3, axis='y')
+    ax7.bar(x_bars - bar_width/2, temp_avgs, bar_width, label='Average', color='steelblue')
+    ax7.bar(x_bars + bar_width/2, temp_maxs, bar_width, label='Peak', color='coral')
+    ax7.axhline(y=temp_limits[0], color='red', linestyle='--', label=f'Limit', alpha=0.7)
+    ax7.set_xlabel('GPU ID')
+    ax7.set_ylabel('Temperature (°C)')
+    ax7.set_title('GPU Temperature Statistics')
+    ax7.set_xticks(x_bars)
+    ax7.set_xticklabels([f'GPU {gid}' for gid in gpu_ids])
+    ax7.legend(fontsize=8)
+    ax7.grid(True, alpha=0.3, axis='y')
     
-    # 6. 統計長條圖 - 功耗
-    ax6 = axes[2, 1]
+    # 8. 統計長條圖 - 功耗
+    ax8 = axes[3, 1]
     
     power_avgs = [np.mean(gpu_stats[gid]['powers']) for gid in gpu_ids]
     power_maxs = [np.max(gpu_stats[gid]['powers']) for gid in gpu_ids]
     
-    ax6.bar(x_bars - bar_width/2, power_avgs, bar_width, label='Average', color='steelblue')
-    ax6.bar(x_bars + bar_width/2, power_maxs, bar_width, label='Peak', color='coral')
-    ax6.axhline(y=power_limits[0], color='red', linestyle='--', label=f'Limit', alpha=0.7)
-    ax6.set_xlabel('GPU ID')
-    ax6.set_ylabel('Power (W)')
-    ax6.set_title('Power Statistics')
-    ax6.set_xticks(x_bars)
-    ax6.set_xticklabels([f'GPU {gid}' for gid in gpu_ids])
-    ax6.legend(fontsize=8)
-    ax6.grid(True, alpha=0.3, axis='y')
+    ax8.bar(x_bars - bar_width/2, power_avgs, bar_width, label='Average', color='steelblue')
+    ax8.bar(x_bars + bar_width/2, power_maxs, bar_width, label='Peak', color='coral')
+    ax8.axhline(y=power_limits[0], color='red', linestyle='--', label=f'Limit', alpha=0.7)
+    ax8.set_xlabel('GPU ID')
+    ax8.set_ylabel('Power (W)')
+    ax8.set_title('GPU Power Statistics')
+    ax8.set_xticks(x_bars)
+    ax8.set_xticklabels([f'GPU {gid}' for gid in gpu_ids])
+    ax8.legend(fontsize=8)
+    ax8.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
     plt.savefig(chart_file, dpi=150, bbox_inches='tight')
